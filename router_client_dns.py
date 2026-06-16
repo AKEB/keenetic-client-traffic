@@ -20,6 +20,8 @@ DEFAULT_USER = "admin"
 DEFAULT_INTERVAL = 2.0
 DEFAULT_TIMEOUT = 25
 DEFAULT_LOG_LINES = 300
+DEFAULT_RETRIES = 3
+SSH_CONTROL_PATH = "/tmp/keenetic-ssh-%r@%h:%p"
 
 
 @dataclass(frozen=True)
@@ -96,6 +98,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Also show router-originated 127.0.0.1 DNS route refreshes if client_ip is 127.0.0.1.",
     )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=None,
+        help=f"Retry transient router SSH failures this many times, default: {DEFAULT_RETRIES}",
+    )
     args = parser.parse_args()
     if args.env_file:
         load_env_file(Path(args.env_file), override=True)
@@ -109,9 +117,8 @@ def main() -> int:
 
     if args.enable_debug:
         code, stdout, stderr = run_router_command(
-            args.host, args.user, args.password, "dns-proxy debug", args.timeout
+            args.host, args.user, args.password, "dns-proxy debug", args.timeout, args.retries
         )
-        code = normalize_router_exit(code, stdout, stderr)
         if code != 0:
             print(f"failed to enable dns-proxy debug rc={code}: {brief_error(stdout, stderr)}", file=sys.stderr)
             return code
@@ -122,9 +129,8 @@ def main() -> int:
 
     if not args.once:
         code, stdout, stderr = run_router_command(
-            args.host, args.user, args.password, log_command(args.log_lines), args.timeout
+            args.host, args.user, args.password, log_command(args.log_lines), args.timeout, args.retries
         )
-        code = normalize_router_exit(code, stdout, stderr)
         if code != 0:
             print(f"router command failed rc={code}: {brief_error(stdout, stderr)}", file=sys.stderr)
             return code
@@ -134,12 +140,16 @@ def main() -> int:
     print_table_header()
     while True:
         code, stdout, stderr = run_router_command(
-            args.host, args.user, args.password, log_command(args.log_lines), args.timeout
+            args.host, args.user, args.password, log_command(args.log_lines), args.timeout, args.retries
         )
-        code = normalize_router_exit(code, stdout, stderr)
         if code != 0:
-            print(f"router command failed rc={code}: {brief_error(stdout, stderr)}", file=sys.stderr)
-            return code
+            print(f"router poll failed rc={code}: {brief_error(stdout, stderr)}", file=sys.stderr)
+            if args.once:
+                return code
+            if stop_at is not None and time.monotonic() >= stop_at:
+                break
+            time.sleep(args.interval)
+            continue
 
         for event in parse_dns_events(stdout, args.client_ip, args.include_router_lookups):
             key = event_key(event)
@@ -210,6 +220,7 @@ def apply_config_defaults(args: argparse.Namespace) -> None:
     args.interval = args.interval if args.interval is not None else env_float("ROUTER_INTERVAL", DEFAULT_INTERVAL)
     args.timeout = args.timeout if args.timeout is not None else env_int("ROUTER_TIMEOUT", DEFAULT_TIMEOUT)
     args.log_lines = args.log_lines if args.log_lines is not None else env_int("ROUTER_LOG_LINES", DEFAULT_LOG_LINES)
+    args.retries = args.retries if args.retries is not None else env_int("ROUTER_RETRIES", DEFAULT_RETRIES)
 
 
 def env_int(name: str, default: int) -> int:
@@ -232,13 +243,54 @@ def env_float(name: str, default: float) -> float:
         raise SystemExit(f"invalid number in {name}: {value}") from exc
 
 
+def ssh_argv(target: str, command: str) -> list[str]:
+    return [
+        "ssh",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-o",
+        "ControlMaster=auto",
+        "-o",
+        f"ControlPath={SSH_CONTROL_PATH}",
+        "-o",
+        "ControlPersist=120",
+        "-o",
+        "ConnectTimeout=10",
+        target,
+        command,
+    ]
+
+
 def run_router_command(
+    host: str,
+    user: str | None,
+    password: str | None,
+    command: str,
+    timeout: int,
+    retries: int = DEFAULT_RETRIES,
+) -> tuple[int, str, str]:
+    last: tuple[int, str, str] = (1, "", "")
+    attempts = max(1, retries)
+    for attempt in range(attempts):
+        code, stdout, stderr = run_router_command_once(host, user, password, command, timeout)
+        code = normalize_router_exit(code, stdout, stderr)
+        last = (code, stdout, stderr)
+        if code == 0 or not is_transient_router_error(code, stdout, stderr):
+            return last
+        if attempt + 1 < attempts:
+            time.sleep(min(2.0**attempt, 5.0))
+    return last
+
+
+def run_router_command_once(
     host: str, user: str | None, password: str | None, command: str, timeout: int
 ) -> tuple[int, str, str]:
     target = host if not user else f"{user}@{host}"
     if password is None:
         proc = subprocess.run(
-            ["ssh", target, command],
+            ssh_argv(target, command),
             text=True,
             capture_output=True,
             timeout=timeout,
@@ -251,7 +303,8 @@ set timeout $env(ROUTER_TIMEOUT)
 set password $env(ROUTER_PASSWORD)
 set target $env(ROUTER_TARGET)
 set command $env(ROUTER_COMMAND)
-spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $target $command
+set control_path $env(ROUTER_CONTROL_PATH)
+spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ControlMaster=auto -o ControlPath=$control_path -o ControlPersist=120 -o ConnectTimeout=10 $target $command
 expect {
     -re "(?i)yes/no" {
         send "yes\r"
@@ -277,6 +330,7 @@ exit [lindex $result 3]
             "ROUTER_TARGET": target,
             "ROUTER_COMMAND": command,
             "ROUTER_TIMEOUT": str(timeout),
+            "ROUTER_CONTROL_PATH": SSH_CONTROL_PATH,
         }
     )
     proc = subprocess.run(
@@ -290,6 +344,21 @@ exit [lindex $result 3]
     return proc.returncode, clean_expect_output(proc.stdout), proc.stderr.strip()
 
 
+def is_transient_router_error(code: int, stdout: str, stderr: str) -> bool:
+    if code in {111, 124}:
+        return True
+    combined = f"{stdout}\n{stderr}".lower()
+    return any(
+        marker in combined
+        for marker in (
+            "connection reset by peer",
+            "connection closed by",
+            "kex_exchange_identification",
+            "connection timed out during banner exchange",
+        )
+    )
+
+
 def normalize_router_exit(code: int, stdout: str, stderr: str) -> int:
     combined = f"{stdout}\n{stderr}".lower()
     if "operation not permitted" in combined:
@@ -299,6 +368,8 @@ def normalize_router_exit(code: int, stdout: str, stderr: str) -> int:
     if "could not resolve hostname" in combined:
         return 68
     if "connection refused" in combined:
+        return 111
+    if "connection reset by peer" in combined or "connection closed by" in combined:
         return 111
     if "timed out" in combined:
         return 124

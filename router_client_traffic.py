@@ -21,6 +21,7 @@ DEFAULT_USER = "admin"
 DEFAULT_INTERVAL = 3.0
 DEFAULT_TIMEOUT = 25
 DEFAULT_DNS_TIMEOUT = 1.0
+SSH_CONTROL_PATH = "/tmp/keenetic-ssh-%r@%h:%p"
 
 
 @dataclass(frozen=True)
@@ -226,13 +227,33 @@ def env_float(name: str, default: float) -> float:
         raise SystemExit(f"invalid number in {name}: {value}") from exc
 
 
+def ssh_argv(target: str, command: str) -> list[str]:
+    return [
+        "ssh",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-o",
+        "ControlMaster=auto",
+        "-o",
+        f"ControlPath={SSH_CONTROL_PATH}",
+        "-o",
+        "ControlPersist=120",
+        "-o",
+        "ConnectTimeout=10",
+        target,
+        command,
+    ]
+
+
 def run_router_command(
     host: str, user: str | None, password: str | None, command: str, timeout: int
 ) -> tuple[int, str, str]:
     target = host if not user else f"{user}@{host}"
     if password is None:
         proc = subprocess.run(
-            ["ssh", target, command],
+            ssh_argv(target, command),
             text=True,
             capture_output=True,
             timeout=timeout,
@@ -245,7 +266,8 @@ set timeout $env(ROUTER_TIMEOUT)
 set password $env(ROUTER_PASSWORD)
 set target $env(ROUTER_TARGET)
 set command $env(ROUTER_COMMAND)
-spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $target $command
+set control_path $env(ROUTER_CONTROL_PATH)
+spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ControlMaster=auto -o ControlPath=$control_path -o ControlPersist=120 -o ConnectTimeout=10 $target $command
 expect {
     -re "(?i)yes/no" {
         send "yes\r"
@@ -271,6 +293,7 @@ exit [lindex $result 3]
             "ROUTER_TARGET": target,
             "ROUTER_COMMAND": command,
             "ROUTER_TIMEOUT": str(timeout),
+            "ROUTER_CONTROL_PATH": SSH_CONTROL_PATH,
         }
     )
     proc = subprocess.run(
@@ -293,6 +316,8 @@ def normalize_router_exit(code: int, stdout: str, stderr: str) -> int:
     if "could not resolve hostname" in combined:
         return 68
     if "connection refused" in combined:
+        return 111
+    if "connection reset by peer" in combined or "connection closed by" in combined:
         return 111
     if "timed out" in combined:
         return 124
